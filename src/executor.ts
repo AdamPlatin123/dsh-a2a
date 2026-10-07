@@ -321,6 +321,9 @@ function status(
  */
 export class DshAgentExecutor implements AgentExecutor {
   private readonly running = new Map<string, RunningTurn>()
+  /** Tail of the per-context turn chain; a session is shared state, so turns
+   * within one context must not interleave their follow-ups and replies. */
+  private readonly contextTurns = new Map<string, Promise<void>>()
   /** Resolved preset ids by preset name; discovery re-reads the roots per call. */
   private readonly presetIds = new Map<string, Promise<string>>()
   /** The mutable model route of every agent this instance created, by session id. */
@@ -353,64 +356,73 @@ export class DshAgentExecutor implements AgentExecutor {
         metadata: {},
       }),
     )
-    try {
-      const overrides = this.overridesOf(requestContext, contextId)
-      const turn = await this.openTurn(
-        sessionIdFor(this.options.agentId, contextId),
-        contextId,
-        overrides,
-      )
-      this.running.set(taskId, turn)
-      // The session event log keeps every turn of the (adopted) session; the
-      // reply and card artifacts must only cover events minted by THIS turn,
-      // so anchor on the log length before the user message is submitted.
-      const baseline = liveEvents(turn.agent.session).length
-      turn.agent.followup(
-        createUserMessage({
-          content: [{ type: 'text', text: textOf(userMessage) }],
-          source: { kind: 'user' },
-        }),
-      )
-      const settled = await withDeadline(turn.agent.whenIdle(), this.options.turnTimeoutMs)
-      if (!settled.done) {
-        turn.agent.cancel({ kind: 'user' })
-        throw new Error(`dsh-a2a: turn exceeded ${this.options.turnTimeoutMs}ms and was cancelled`)
+    const priorTurn = (this.contextTurns.get(contextId) ?? Promise.resolve()).catch(() => undefined)
+    const turnChain = priorTurn.then(async () => {
+      try {
+        const overrides = this.overridesOf(requestContext, contextId)
+        const turn = await this.openTurn(
+          sessionIdFor(this.options.agentId, contextId),
+          contextId,
+          overrides,
+        )
+        this.running.set(taskId, turn)
+        // The session event log keeps every turn of the (adopted) session; the
+        // reply and card artifacts must only cover events minted by THIS turn,
+        // so anchor on the log length before the user message is submitted.
+        const baseline = liveEvents(turn.agent.session).length
+        turn.agent.followup(
+          createUserMessage({
+            content: [{ type: 'text', text: textOf(userMessage) }],
+            source: { kind: 'user' },
+          }),
+        )
+        const settled = await withDeadline(turn.agent.whenIdle(), this.options.turnTimeoutMs)
+        if (!settled.done) {
+          turn.agent.cancel({ kind: 'user' })
+          throw new Error(
+            `dsh-a2a: turn exceeded ${this.options.turnTimeoutMs}ms and was cancelled`,
+          )
+        }
+        // Cards rendered during the turn (e.g. render_card tool) ship as file
+        // artifacts BEFORE the terminal status: the SDK's execution queue ends
+        // the event stream at the first terminal statusUpdate, so artifacts
+        // published afterwards would never reach the caller.
+        const turnEvents = liveEvents(turn.agent.session).slice(baseline)
+        await this.publishCardArtifacts(eventBus, taskId, contextId, turnEvents)
+        // The reply must ride ON the terminal status: publishing a separate
+        // message first would strand the task in WORKING forever in the task
+        // store.
+        eventBus.publish(
+          AgentEvent.statusUpdate({
+            taskId,
+            contextId,
+            status: status(
+              TaskStateEnum.TASK_STATE_COMPLETED,
+              agentMessage(collectReplyText(turnEvents), taskId, contextId),
+            ),
+            metadata: {},
+          }),
+        )
+      } catch (error) {
+        eventBus.publish(
+          AgentEvent.statusUpdate({
+            taskId,
+            contextId,
+            status: status(
+              TaskStateEnum.TASK_STATE_FAILED,
+              agentMessage(`dsh-a2a: ${String(error)}`, taskId, contextId),
+            ),
+            metadata: {},
+          }),
+        )
+      } finally {
+        this.running.delete(taskId)
       }
-      // Cards rendered during the turn (e.g. render_card tool) ship as file
-      // artifacts BEFORE the terminal status: the SDK's execution queue ends
-      // the event stream at the first terminal statusUpdate, so artifacts
-      // published afterwards would never reach the caller.
-      const turnEvents = liveEvents(turn.agent.session).slice(baseline)
-      await this.publishCardArtifacts(eventBus, taskId, contextId, turnEvents)
-      // The reply must ride ON the terminal status: publishing a separate
-      // message first would strand the task in WORKING forever in the task
-      // store.
-      eventBus.publish(
-        AgentEvent.statusUpdate({
-          taskId,
-          contextId,
-          status: status(
-            TaskStateEnum.TASK_STATE_COMPLETED,
-            agentMessage(collectReplyText(turnEvents), taskId, contextId),
-          ),
-          metadata: {},
-        }),
-      )
-    } catch (error) {
-      eventBus.publish(
-        AgentEvent.statusUpdate({
-          taskId,
-          contextId,
-          status: status(
-            TaskStateEnum.TASK_STATE_FAILED,
-            agentMessage(`dsh-a2a: ${String(error)}`, taskId, contextId),
-          ),
-          metadata: {},
-        }),
-      )
-    } finally {
-      this.running.delete(taskId)
-    }
+    })
+    this.contextTurns.set(contextId, turnChain)
+    await turnChain.finally(() => {
+      if (this.contextTurns.get(contextId) === turnChain) this.contextTurns.delete(contextId)
+    })
   }
 
   async cancelTask(taskId: string, eventBus: ExecutionEventBus): Promise<void> {
