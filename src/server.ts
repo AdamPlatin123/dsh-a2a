@@ -32,7 +32,9 @@ import {
   JsonRpcTransportHandler,
   ServerCallContext,
 } from '@a2a-js/sdk/server'
+import { bearerMatches } from './auth.js'
 import type { ResolvedAgentSpec, ResolvedServer } from './config.js'
+import { createBoundedTaskStore } from './task-store.js'
 
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 /** REST-binding verb suffix for cancelling a task (`POST tasks/<id>:cancel`). */
@@ -153,6 +155,11 @@ interface AgentRoute {
  * executor. `/.well-known/agent-card.json` lists them (there is no default
  * agent at `/`), so an A2A client addresses a specific agent by path.
  */
+/** Hosts an unauthenticated endpoint may still bind: loopback only. */
+function isLoopbackHost(host: string): boolean {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost' || host === '[::1]'
+}
+
 export class A2aServer {
   private http: HttpServer | undefined
   private readonly sockets = new Set<import('node:net').Socket>()
@@ -166,7 +173,7 @@ export class A2aServer {
       // `supportedInterfaces[].url` to pick the transport endpoint, so each
       // card must point at ITS OWN `/agents/<id>/` (there is no `/` agent).
       const card = buildAgentCard(options.config, this.url, agent, this.urlFor(basePath))
-      const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), executor)
+      const handler = new DefaultRequestHandler(card, createBoundedTaskStore(), executor)
       this.routes.set(agent.id, { id: agent.id, card, handler, basePath, spec: agent, executor })
       this.cards.push(card)
     }
@@ -182,7 +189,7 @@ export class A2aServer {
     }
     const basePath = `/agents/${agent.id}`
     const card = buildAgentCard(this.options.config, this.url, agent, this.urlFor(basePath))
-    const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), executor)
+    const handler = new DefaultRequestHandler(card, createBoundedTaskStore(), executor)
     this.routes.set(agent.id, { id: agent.id, card, handler, basePath, spec: agent, executor })
     this.cards.push(card)
   }
@@ -289,6 +296,18 @@ export class A2aServer {
   /** Bind the configured port; resolves once listening. */
   async start(): Promise<void> {
     if (this.http !== undefined) return
+    // Fail-closed: an unauthenticated endpoint on a non-loopback bind would
+    // hand any reachable host a proxy into the local harness. Require an
+    // apiKey for network-reachable hosts.
+    const apiKey = this.options.config.apiKey
+    if (
+      (apiKey === undefined || apiKey.length === 0) &&
+      !isLoopbackHost(this.options.config.host)
+    ) {
+      throw new Error(
+        `dsh-a2a: refusing to serve an unauthenticated A2A endpoint on ${this.options.config.host}; set server.apiKey or bind a loopback host`,
+      )
+    }
     const http = createServer((req, res) => this.route(req, res))
     http.on('connection', (socket) => {
       this.sockets.add(socket)
@@ -326,8 +345,7 @@ export class A2aServer {
         return
       }
       if (!isDiscovery && this.options.config.apiKey !== undefined) {
-        const expected = `Bearer ${this.options.config.apiKey}`
-        if (req.headers.authorization !== expected) {
+        if (!bearerMatches(req.headers.authorization, this.options.config.apiKey)) {
           sendJson(res, 401, { error: 'unauthorized' })
           return
         }

@@ -16,6 +16,7 @@
 import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
+import { bearerMatches } from './auth.js'
 import type { AgentCardProbe, ServerRef } from './typert.js'
 import { serverInfoOf } from './typert.js'
 
@@ -117,10 +118,7 @@ export function registerA2aRoutes(
       const managementAuthorized = (req: IncomingMessage): boolean => {
         const expected = ref.server?.apiKey
         if (typeof expected !== 'string' || expected.length === 0) return true
-        const headers = (req.headers ?? {}) as Record<string, string | string[] | undefined>
-        const presented = headers.authorization
-        const value = Array.isArray(presented) ? presented[0] : presented
-        return value === `Bearer ${expected}`
+        return bearerMatches(req.headers.authorization, expected)
       }
 
       disposers.push(

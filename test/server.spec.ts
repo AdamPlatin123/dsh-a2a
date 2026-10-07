@@ -12,7 +12,7 @@ import type { AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server'
 import type { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
 import { resolveConfig } from '../src/config.js'
-import { DshAgentExecutor, sessionIdFor, textPart } from '../src/executor.js'
+import { DshAgentExecutor, textPart } from '../src/executor.js'
 import { A2aServer } from '../src/server.js'
 import { freePort } from './net.js'
 
@@ -35,7 +35,7 @@ interface SessionEventLike {
 class FakeAgent {
   status: 'idle' | 'busy' = 'idle'
   readonly session = { events: [] as SessionEventLike[] }
-  private resolveIdle?: () => void
+  protected resolveIdle?: () => void
   /** When true, the turn never finishes until cancel() is called. */
   hang = false
   cancelled = false
@@ -230,6 +230,141 @@ describe('A2A server with a harness executor', () => {
     } finally {
       await server.stop()
     }
+  })
+
+  it('serializes concurrent messages within one context', async () => {
+    const port = await freePort()
+    const agents = new Map<string, FakeAgent>()
+    const ctx = fakeCtx(agents)
+    /** Pushes its reply but only goes idle when released; every waiter wakes. */
+    class GatedAgent extends FakeAgent {
+      private readonly waiters = new Set<() => void>()
+      override followup(): void {
+        this.status = 'busy'
+        this.session.events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: 'pong' }] } },
+        })
+      }
+      override whenIdle(): Promise<void> {
+        return new Promise((resolve) => {
+          this.waiters.add(resolve)
+        })
+      }
+      release(): void {
+        this.status = 'idle'
+        for (const wake of this.waiters) wake()
+        this.waiters.clear()
+      }
+    }
+    let gated: GatedAgent | undefined
+    ;(
+      ctx as unknown as {
+        agents: {
+          create: (call: CreateCall) => Promise<{ agent: FakeAgent; dispose: () => Promise<void> }>
+        }
+      }
+    ).agents.create = async (call: CreateCall) => {
+      await call.setup?.({
+        agentPresets: { mount: async () => undefined },
+        on: () => () => undefined,
+      } as unknown as Context)
+      gated = new GatedAgent()
+      agents.set(call.sessionId, gated)
+      return { agent: gated, dispose: async () => undefined }
+    }
+    const executor = new DshAgentExecutor(ctx, {
+      agentId: 'test',
+      preset: 'standard',
+      turnTimeoutMs: 10_000,
+    })
+    const server = new A2aServer({
+      config: resolveConfig({ server: { host: '127.0.0.1', port } }).server,
+      agents: [{ agent: testAgent, executor }],
+    })
+    await server.start()
+    try {
+      const client = await new ClientFactory(ClientFactoryOptions.default).createFromUrl(
+        `${server.url}agents/test/`,
+      )
+      const message = (n: number): Message => ({
+        ...userMessage(`m-${n}`),
+        messageId: `m-${n}`,
+        contextId: 'ctx-serial',
+      })
+      const first = client.sendMessage({
+        tenant: '',
+        message: message(1),
+        configuration: undefined,
+        metadata: undefined,
+      })
+      // Wait for turn 1 to be in flight, then fire turn 2 at the same context.
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      if (gated === undefined) throw new Error('agent was never created')
+      expect(gated.session.events).toHaveLength(1)
+      const second = client.sendMessage({
+        tenant: '',
+        message: message(2),
+        configuration: undefined,
+        metadata: undefined,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      // Turn 2 must not have started while turn 1 holds the shared session.
+      expect(gated.session.events).toHaveLength(1)
+      gated.release()
+      // Turn 2 starts once turn 1 finishes; give it its own release.
+      for (let i = 0; i < 100 && gated.session.events.length < 2; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      gated.release()
+      const results = await Promise.all([first, second])
+      expect(gated.session.events).toHaveLength(2)
+      for (const result of results) {
+        const task = result as unknown as { status: { message?: Message } }
+        const reply = (task.status.message?.parts ?? [])
+          .map((part) => (part.content?.$case === 'text' ? part.content.value : ''))
+          .join('')
+        expect(reply).toBe('pong')
+      }
+    } finally {
+      await server.stop()
+    }
+  })
+
+  it('refuses to expose an unauthenticated endpoint on a non-loopback host', async () => {
+    const port = await freePort()
+    const server = new A2aServer({
+      config: resolveConfig({ server: { host: '0.0.0.0', port } }).server,
+      agents: [
+        {
+          agent: testAgent,
+          executor: new DshAgentExecutor(fakeCtx(new Map()), {
+            agentId: 'test',
+            preset: 'standard',
+            turnTimeoutMs: 10_000,
+          }),
+        },
+      ],
+    })
+    // No apiKey configured: a listener reachable from the network must not
+    // come up as an open proxy into the local harness.
+    await expect(server.start()).rejects.toThrow(/apiKey|loopback/)
+    // With a key configured the same binding is allowed.
+    const keyed = new A2aServer({
+      config: resolveConfig({ server: { host: '0.0.0.0', port, apiKey: 'k' } }).server,
+      agents: [
+        {
+          agent: testAgent,
+          executor: new DshAgentExecutor(fakeCtx(new Map()), {
+            agentId: 'test',
+            preset: 'standard',
+            turnTimeoutMs: 10_000,
+          }),
+        },
+      ],
+    })
+    await keyed.start()
+    await keyed.stop()
   })
 
   it('returns only the current turn reply for follow-ups in one context', async () => {
